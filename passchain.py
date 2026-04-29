@@ -27,7 +27,6 @@ def decrypt(nonce: bytes, ciphertext: bytes, key: bytes) -> str:
 # --------------------------------------------------------------------------
 # Database Access
 # --------------------------------------------------------------------------
-
 def get_dsn() -> str:
     dsn = os.environ.get("PASSCHAIN_DSN")
     if not dsn:
@@ -65,3 +64,17 @@ def ensure_tables(conn):
             )
         """)
     conn.commit()
+
+
+def main():
+    conn = get_conn(get_dsn())
+    ensure_tables(conn)
+
+    # Placeholder for CLI commands (e.g., init, add, get, list)
+    print("[passchain] Database initialized and ready.")
+    
+    conn.close()
+ 
+ 
+if __name__ == "__main__":
+    main()
