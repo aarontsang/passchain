@@ -65,14 +65,47 @@ def ensure_tables(conn):
         """)
     conn.commit()
 
+# --------------------------------------------------------------------------
+# Master Key Management
+# --------------------------------------------------------------------------
 
+VERIFIER_PLAINTEXT = "passchain-ok"
+
+def set_master_key(conn, master_key: bytes):
+    """Initialize master key. Should be called once."""
+    kdf_salt = os.urandom(16)
+    nonce, verifier = encrypt(VERIFIER_PLAINTEXT, master_key)
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO passchain_master (kdf_salt, nonce, verifier) VALUES (%s, %s, %s)",
+                    (kdf_salt, nonce, verifier))
+    conn.commit()
+
+def master_set(conn) -> bool:
+    """Check if master key is set up. Returns True if already initialized."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM passchain_master")
+        return cur.fetchone()[0] > 0
+
+def verify_master_key(conn, master_key: bytes) -> bool:
+    """Verify master key by decrypting the verifier."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT kdf_salt, nonce, verifier FROM passchain_master LIMIT 1")
+        row = cur.fetchone()
+        if not row:
+            return False
+        kdf_salt, nonce, verifier = row
+        try:
+            decrypted = decrypt(nonce, verifier, master_key)
+            return decrypted == VERIFIER_PLAINTEXT
+        except Exception:
+            return False
+        
 def main():
     conn = get_conn(get_dsn())
     ensure_tables(conn)
 
     # Placeholder for CLI commands (e.g., init, add, get, list)
     print("[passchain] Database initialized and ready.")
-    
     conn.close()
  
  
