@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import getpass
  
 import psycopg2
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -100,6 +101,25 @@ def verify_master_key(conn, master_key: bytes) -> bool:
         except Exception:
             return False
         
+# --------------------------------------------------------------------------
+# CLI Commands
+# --------------------------------------------------------------------------
+
+def cmd_init(conn):
+    if master_set(conn):
+        print("[passchain] Master password already set.")
+        print("           To change it, run: passchain change-master")
+        return
+ 
+    pw1 = getpass.getpass("Set master password: ")
+    pw2 = getpass.getpass("Confirm master password: ")
+    if pw1 != pw2:
+        sys.exit("[passchain] Passwords do not match.")
+    if len(pw1) < 8:
+        sys.exit("[passchain] Master password must be at least 8 characters.")
+ 
+    set_master_key(conn, pw1)
+
 def main():
     conn = get_conn(get_dsn())
     ensure_tables(conn)
