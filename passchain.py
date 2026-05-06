@@ -165,6 +165,48 @@ def cmd_add(conn, args):
     conn.commit()
 
     print(f"[passchain] Entry for {service} / {username} added successfully.")
+
+def cmd_update(conn, args):
+    service = args.service.strip().lower()
+    username = args.username.strip()
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM passchain_entries WHERE service = %s AND username = %s",
+                    (service, username))
+        exists = cur.fetchone() is not None
+
+    if not exists:
+        print(f"[passchain] Entry for {service} / {username} does not exist.")
+        print("           To add it, run: passchain add")
+        return
+
+    for i in range(5):
+        master_pw = getpass.getpass("Master password: ")
+        if verify_master_key(conn, master_pw):
+            break
+        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
+    else:
+        sys.exit("[passchain] Incorrect master password.")
+    
+
+    # TODO: Extract to a password verifier to make sure it meets certain requirements
+    password = getpass.getpass(f"Password for {service} / {username}: ")
+    if not password:
+        sys.exit("[passchain] Password cannot be empty.")
+
+    salt = os.urandom(16)
+    key = derive_key(master_pw.encode(), salt)
+    nonce, ciphertext = encrypt(password, key)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE passchain_entries
+            SET kdf_salt = %s, nonce = %s, ciphertext = %s
+            WHERE service = %s AND username = %s
+        """, (service, username, salt, nonce, ciphertext))
+    conn.commit()
+
+    print(f"[passchain] Entry for {service} / {username} updated successfully.")
             
 def main():
     conn = get_conn(get_dsn())
