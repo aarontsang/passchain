@@ -208,6 +208,34 @@ def cmd_update(conn, args):
 
     print(f"[passchain] Entry for {service} / {username} updated successfully.")
             
+def cmd_get(conn, args):
+    service = args.service.strip().lower()
+    username = args.username.strip()
+
+    for i in range(5):
+        master_pw = getpass.getpass("Master password: ")
+        if verify_master_key(conn, master_pw):
+            break
+        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
+    else:
+        sys.exit("[passchain] Incorrect master password.")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT kdf_salt, nonce, ciphertext FROM passchain_entries WHERE service = %s AND username = %s",
+                    (service, username))
+        row = cur.fetchone()
+        if not row:
+            sys.exit(f"[passchain] Entry for {service} / {username} not found.")
+        kdf_salt, nonce, ciphertext = row
+
+    key = derive_key(master_pw.encode(), kdf_salt)
+    try:
+        password = decrypt(nonce, ciphertext, key)
+        print(f"[passchain] Password for {service} / {username}: {password}")
+    except Exception:
+        sys.exit("[passchain] Failed to decrypt password. Possible data corruption or wrong master key.")
+
+
 def main():
     conn = get_conn(get_dsn())
     ensure_tables(conn)
