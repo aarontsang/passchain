@@ -282,6 +282,47 @@ def cmd_delete(conn, args):
 
     print(f"[passchain] Entry for {service} / {username} deleted successfully.")
 
+def cmd_change_master(conn, args):
+    if not master_set(conn):
+        print("[passchain] Master password is not set. Run 'passchain init' first.")
+        return
+
+    for i in range(5):
+        old_master_pw = getpass.getpass("Current master password: ")
+        if verify_master_key(conn, old_master_pw):
+            break
+        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
+    else:
+        sys.exit("[passchain] Incorrect master password.")
+
+    new_pw1 = getpass.getpass("New master password: ")
+    new_pw2 = getpass.getpass("Confirm new master password: ")
+    if new_pw1 != new_pw2:
+        sys.exit("[passchain] New passwords do not match.")
+    if len(new_pw1) < 8:
+        sys.exit("[passchain] New master password must be at least 8 characters.")
+    
+    # Re-encrypt all entries with the new master key
+    with conn.cursor() as cur:
+        cur.execute("SELECT service, username, kdf_salt, nonce, ciphertext FROM passchain_entries")
+        entries = cur.fetchall()
+    new_salt = os.urandom(16)
+    new_master_key = derive_key(new_pw1.encode(), new_salt)
+    for service, username, kdf_salt, nonce, ciphertext in entries:
+        old_key = derive_key(old_master_pw.encode(), kdf_salt)
+        try:
+            plaintext = decrypt(nonce, ciphertext, old_key)
+        except Exception:
+            sys.exit(f"[passchain] Failed to decrypt entry for {service} / {username}. Aborting master password change.")
+        
+        new_nonce, new_ciphertext = encrypt(plaintext, new_master_key)
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE passchain_entries
+                SET kdf_salt = %s, nonce = %s, ciphertext = %s
+                WHERE service = %s AND username = %s
+            """, (new_salt, new_nonce, new_ciphertext, service, username))
+            
 def main():
     conn = get_conn(get_dsn())
     ensure_tables(conn)
