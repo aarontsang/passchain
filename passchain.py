@@ -2,7 +2,8 @@ import argparse
 import os
 import sys
 import getpass
- 
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
 import psycopg2
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -13,6 +14,11 @@ SCRYPT_N = 2**17   # scrypt iterations
 SCRYPT_R = 8       # scrypt block size
 SCRYPT_P = 1       # scrypt parallelization
 KEY_LEN  = 32      # 256-bit key for AES-256-GCM
+
+def derive_key(master_password: str, salt: bytes) -> bytes:
+    """Derive a 256-bit AES key from the master password using scrypt."""
+    kdf = Scrypt(salt=salt, length=KEY_LEN, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
+    return kdf.derive(master_password.encode())
 
 def encrypt(plaintext: str, key: bytes) -> tuple[bytes, bytes]:
     """Encrypt with AES-256-GCM. Returns (nonce, ciphertext_with_tag)."""
@@ -120,6 +126,46 @@ def cmd_init(conn):
  
     set_master_key(conn, pw1)
 
+def cmd_add(conn, args):
+    service = args.service.strip().lower()
+    username = args.username.strip()
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM passchain_entries WHERE service = %s AND username = %s",
+                    (service, username))
+        exists = cur.fetchone() is not None
+
+    if exists:
+        print(f"[passchain] Entry for {service} / {username} already exists.")
+        print("           To update it, run: passchain update")
+        return
+
+    for i in range(5):
+        master_pw = getpass.getpass("Master password: ")
+        if verify_master_key(conn, master_pw):
+            break
+        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
+    else:
+        sys.exit("[passchain] Incorrect master password.")
+    
+    # TODO: Extract to a password verifier to make sure it meets certain requirements
+    password = getpass.getpass(f"Password for {service} / {username}: ")
+    if not password:
+        sys.exit("[passchain] Password cannot be empty.")
+
+    salt = os.urandom(16)
+    key = derive_key(master_pw.encode(), salt)
+    nonce, ciphertext = encrypt(password, key)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO passchain_entries (service, username, kdf_salt, nonce, ciphertext)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (service, username, salt, nonce, ciphertext))
+    conn.commit()
+
+    print(f"[passchain] Entry for {service} / {username} added successfully.")
+            
 def main():
     conn = get_conn(get_dsn())
     ensure_tables(conn)
