@@ -322,7 +322,10 @@ def cmd_change_master(conn, args):
                 SET kdf_salt = %s, nonce = %s, ciphertext = %s
                 WHERE service = %s AND username = %s
             """, (new_salt, new_nonce, new_ciphertext, service, username))
-            
+    set_master_key(conn, new_pw1, commit=False)
+    conn.commit()
+    print(f"[passchain] Done. {len(entries)} entries re-encrypted.")
+    
 def main():
     conn = get_conn(get_dsn())
     ensure_tables(conn)
