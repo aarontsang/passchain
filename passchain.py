@@ -235,7 +235,24 @@ def cmd_get(conn, args):
     except Exception:
         sys.exit("[passchain] Failed to decrypt password. Possible data corruption or wrong master key.")
 
+def cmd_list(conn, args):
+    for i in range(5):
+        master_pw = getpass.getpass("Master password: ")
+        if verify_master_key(conn, master_pw):
+            break
+        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
+    else:
+        sys.exit("[passchain] Incorrect master password.")
 
+    with conn.cursor() as cur:
+        cur.execute("SELECT service, username FROM passchain_entries ORDER BY service DESC")
+        rows = cur.fetchall()
+        if not rows:
+            print("[passchain] No entries found.")
+            return
+        print("[passchain] Stored entries:")
+        for service, username in rows:
+            print(f"  - {service} / {username}")
 def main():
     conn = get_conn(get_dsn())
     ensure_tables(conn)
