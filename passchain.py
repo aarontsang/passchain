@@ -253,6 +253,35 @@ def cmd_list(conn, args):
         print("[passchain] Stored entries:")
         for service, username in rows:
             print(f"  - {service} / {username}")
+
+def cmd_delete(conn, args):
+    service = args.service.strip().lower()
+    username = args.username.strip()
+
+    for i in range(5):
+        master_pw = getpass.getpass("Master password: ")
+        if verify_master_key(conn, master_pw):
+            break
+        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
+    else:
+        sys.exit("[passchain] Incorrect master password.")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM passchain_entries WHERE service = %s AND username = %s",
+                    (service, username))
+        exists = cur.fetchone()[0] > 0
+
+    if not exists:
+        print(f"[passchain] Entry for {service} / {username} does not exist.")
+        return
+
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM passchain_entries WHERE service = %s AND username = %s",
+                    (service, username))
+    conn.commit()
+
+    print(f"[passchain] Entry for {service} / {username} deleted successfully.")
+
 def main():
     conn = get_conn(get_dsn())
     ensure_tables(conn)
