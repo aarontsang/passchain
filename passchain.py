@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import argparse
 import os
 import sys
@@ -10,26 +12,25 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # --------------------------------------------------------------------------
 # Encryption Data
 # --------------------------------------------------------------------------
-SCRYPT_N = 2**17   # scrypt iterations
-SCRYPT_R = 8       # scrypt block size
-SCRYPT_P = 1       # scrypt parallelization
-KEY_LEN  = 32      # 256-bit key for AES-256-GCM
+SCRYPT_N = 2**17
+SCRYPT_R = 8
+SCRYPT_P = 1
+KEY_LEN  = 32
 
 def derive_key(master_password: str, salt: bytes) -> bytes:
     """Derive a 256-bit AES key from the master password using scrypt."""
     kdf = Scrypt(salt=salt, length=KEY_LEN, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
-    return kdf.derive(master_password.encode())
+    return bytes(kdf.derive(master_password.encode()))
 
 def encrypt(plaintext: str, key: bytes) -> tuple[bytes, bytes]:
     """Encrypt with AES-256-GCM. Returns (nonce, ciphertext_with_tag)."""
     nonce = os.urandom(12)
-    ct = AESGCM(key).encrypt(nonce, plaintext.encode(), None)
+    ct = AESGCM(key).encrypt(nonce, plaintext.encode(), None)  # key is already bytes
     return nonce, ct
- 
- 
+
 def decrypt(nonce: bytes, ciphertext: bytes, key: bytes) -> str:
     """Decrypt AES-256-GCM. Raises InvalidTag on wrong key or tampered data."""
-    return AESGCM(key).decrypt(nonce, ciphertext, None).decode()
+    return AESGCM(key).decrypt(nonce, ciphertext, None).decode()  # key is already bytes
 
 # --------------------------------------------------------------------------
 # Database Access
@@ -78,14 +79,16 @@ def ensure_tables(conn):
 
 VERIFIER_PLAINTEXT = "passchain-ok"
 
-def set_master_key(conn, master_key: bytes):
+def set_master_key(conn, master_password: str, commit: bool = True):
     """Initialize master key. Should be called once."""
-    kdf_salt = os.urandom(16)
-    nonce, verifier = encrypt(VERIFIER_PLAINTEXT, master_key)
+    salt = os.urandom(16)
+    key = derive_key(master_password, salt)  # derive key from password
+    nonce, verifier = encrypt(VERIFIER_PLAINTEXT, key)
     with conn.cursor() as cur:
         cur.execute("INSERT INTO passchain_master (kdf_salt, nonce, verifier) VALUES (%s, %s, %s)",
-                    (kdf_salt, nonce, verifier))
-    conn.commit()
+                    (salt, nonce, verifier))
+    if commit:
+        conn.commit()
 
 def master_set(conn) -> bool:
     """Check if master key is set up. Returns True if already initialized."""
@@ -93,8 +96,8 @@ def master_set(conn) -> bool:
         cur.execute("SELECT COUNT(*) FROM passchain_master")
         return cur.fetchone()[0] > 0
 
-def verify_master_key(conn, master_key: bytes) -> bool:
-    """Verify master key by decrypting the verifier."""
+def verify_master_key(conn, master_password: str) -> bool:
+    """Verify master password by decrypting the verifier."""
     with conn.cursor() as cur:
         cur.execute("SELECT kdf_salt, nonce, verifier FROM passchain_master LIMIT 1")
         row = cur.fetchone()
@@ -102,29 +105,40 @@ def verify_master_key(conn, master_key: bytes) -> bool:
             return False
         kdf_salt, nonce, verifier = row
         try:
-            decrypted = decrypt(nonce, verifier, master_key)
+            key = derive_key(master_password, bytes(kdf_salt))
+            decrypted = decrypt(bytes(nonce), bytes(verifier), key)
             return decrypted == VERIFIER_PLAINTEXT
         except Exception:
             return False
-        
+
 # --------------------------------------------------------------------------
 # CLI Commands
 # --------------------------------------------------------------------------
 
-def cmd_init(conn):
+def prompt_master(conn) -> str:
+    """Prompt for master password with up to 5 attempts."""
+    for i in range(5):
+        master_pw = getpass.getpass("Master password: ")
+        if verify_master_key(conn, master_pw):
+            return master_pw
+        print("[passchain] Incorrect master password. {} attempts left.".format(4 - i))
+    sys.exit("[passchain] Too many incorrect attempts.")
+
+def cmd_init(conn, args):
     if master_set(conn):
         print("[passchain] Master password already set.")
         print("           To change it, run: passchain change-master")
         return
- 
+
     pw1 = getpass.getpass("Set master password: ")
     pw2 = getpass.getpass("Confirm master password: ")
     if pw1 != pw2:
         sys.exit("[passchain] Passwords do not match.")
     if len(pw1) < 8:
         sys.exit("[passchain] Master password must be at least 8 characters.")
- 
-    set_master_key(conn, pw1)
+
+    set_master_key(conn, pw1)  # pass raw password, derive_key happens inside
+    print("[passchain] Master password set successfully.")
 
 def cmd_add(conn, args):
     service = args.service.strip().lower()
@@ -133,28 +147,21 @@ def cmd_add(conn, args):
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM passchain_entries WHERE service = %s AND username = %s",
                     (service, username))
-        exists = cur.fetchone() is not None
+        exists = cur.fetchone()[0] > 0  # fixed: was checking fetchone() is not None (always True)
 
     if exists:
         print(f"[passchain] Entry for {service} / {username} already exists.")
         print("           To update it, run: passchain update")
         return
 
-    for i in range(5):
-        master_pw = getpass.getpass("Master password: ")
-        if verify_master_key(conn, master_pw):
-            break
-        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
-    else:
-        sys.exit("[passchain] Incorrect master password.")
-    
-    # TODO: Extract to a password verifier to make sure it meets certain requirements
+    master_pw = prompt_master(conn)
+
     password = getpass.getpass(f"Password for {service} / {username}: ")
     if not password:
         sys.exit("[passchain] Password cannot be empty.")
 
     salt = os.urandom(16)
-    key = derive_key(master_pw.encode(), salt)
+    key = derive_key(master_pw, salt)
     nonce, ciphertext = encrypt(password, key)
 
     with conn.cursor() as cur:
@@ -173,29 +180,21 @@ def cmd_update(conn, args):
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM passchain_entries WHERE service = %s AND username = %s",
                     (service, username))
-        exists = cur.fetchone() is not None
+        exists = cur.fetchone()[0] > 0  # fixed: was checking fetchone() is not None (always True)
 
     if not exists:
         print(f"[passchain] Entry for {service} / {username} does not exist.")
         print("           To add it, run: passchain add")
         return
 
-    for i in range(5):
-        master_pw = getpass.getpass("Master password: ")
-        if verify_master_key(conn, master_pw):
-            break
-        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
-    else:
-        sys.exit("[passchain] Incorrect master password.")
-    
+    master_pw = prompt_master(conn)
 
-    # TODO: Extract to a password verifier to make sure it meets certain requirements
-    password = getpass.getpass(f"Password for {service} / {username}: ")
+    password = getpass.getpass(f"New password for {service} / {username}: ")
     if not password:
         sys.exit("[passchain] Password cannot be empty.")
 
     salt = os.urandom(16)
-    key = derive_key(master_pw.encode(), salt)
+    key = derive_key(master_pw, salt)
     nonce, ciphertext = encrypt(password, key)
 
     with conn.cursor() as cur:
@@ -203,22 +202,16 @@ def cmd_update(conn, args):
             UPDATE passchain_entries
             SET kdf_salt = %s, nonce = %s, ciphertext = %s
             WHERE service = %s AND username = %s
-        """, (service, username, salt, nonce, ciphertext))
+        """, (salt, nonce, ciphertext, service, username))  # fixed: salt/nonce/ct must come before service/username
     conn.commit()
 
     print(f"[passchain] Entry for {service} / {username} updated successfully.")
-            
+
 def cmd_get(conn, args):
     service = args.service.strip().lower()
     username = args.username.strip()
 
-    for i in range(5):
-        master_pw = getpass.getpass("Master password: ")
-        if verify_master_key(conn, master_pw):
-            break
-        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
-    else:
-        sys.exit("[passchain] Incorrect master password.")
+    master_pw = prompt_master(conn)
 
     with conn.cursor() as cur:
         cur.execute("SELECT kdf_salt, nonce, ciphertext FROM passchain_entries WHERE service = %s AND username = %s",
@@ -228,21 +221,15 @@ def cmd_get(conn, args):
             sys.exit(f"[passchain] Entry for {service} / {username} not found.")
         kdf_salt, nonce, ciphertext = row
 
-    key = derive_key(master_pw.encode(), kdf_salt)
+    key = derive_key(master_pw, bytes(kdf_salt))
     try:
-        password = decrypt(nonce, ciphertext, key)
+        password = decrypt(bytes(nonce), bytes(ciphertext), key)
         print(f"[passchain] Password for {service} / {username}: {password}")
     except Exception:
         sys.exit("[passchain] Failed to decrypt password. Possible data corruption or wrong master key.")
 
 def cmd_list(conn, args):
-    for i in range(5):
-        master_pw = getpass.getpass("Master password: ")
-        if verify_master_key(conn, master_pw):
-            break
-        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
-    else:
-        sys.exit("[passchain] Incorrect master password.")
+    prompt_master(conn)
 
     with conn.cursor() as cur:
         cur.execute("SELECT service, username FROM passchain_entries ORDER BY service DESC")
@@ -258,14 +245,6 @@ def cmd_delete(conn, args):
     service = args.service.strip().lower()
     username = args.username.strip()
 
-    for i in range(5):
-        master_pw = getpass.getpass("Master password: ")
-        if verify_master_key(conn, master_pw):
-            break
-        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
-    else:
-        sys.exit("[passchain] Incorrect master password.")
-
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM passchain_entries WHERE service = %s AND username = %s",
                     (service, username))
@@ -274,6 +253,8 @@ def cmd_delete(conn, args):
     if not exists:
         print(f"[passchain] Entry for {service} / {username} does not exist.")
         return
+
+    prompt_master(conn)
 
     with conn.cursor() as cur:
         cur.execute("DELETE FROM passchain_entries WHERE service = %s AND username = %s",
@@ -287,13 +268,7 @@ def cmd_change_master(conn, args):
         print("[passchain] Master password is not set. Run 'passchain init' first.")
         return
 
-    for i in range(5):
-        old_master_pw = getpass.getpass("Current master password: ")
-        if verify_master_key(conn, old_master_pw):
-            break
-        print("[passchain] Incorrect master password. {} attempts left. Try again.".format(4 - i))
-    else:
-        sys.exit("[passchain] Incorrect master password.")
+    old_master_pw = prompt_master(conn)
 
     new_pw1 = getpass.getpass("New master password: ")
     new_pw2 = getpass.getpass("Confirm new master password: ")
@@ -301,20 +276,21 @@ def cmd_change_master(conn, args):
         sys.exit("[passchain] New passwords do not match.")
     if len(new_pw1) < 8:
         sys.exit("[passchain] New master password must be at least 8 characters.")
-    
-    # Re-encrypt all entries with the new master key
+
     with conn.cursor() as cur:
         cur.execute("SELECT service, username, kdf_salt, nonce, ciphertext FROM passchain_entries")
         entries = cur.fetchall()
+
     new_salt = os.urandom(16)
-    new_master_key = derive_key(new_pw1.encode(), new_salt)
+    new_master_key = derive_key(new_pw1, new_salt)
+
     for service, username, kdf_salt, nonce, ciphertext in entries:
-        old_key = derive_key(old_master_pw.encode(), kdf_salt)
+        old_key = derive_key(old_master_pw, bytes(kdf_salt))
         try:
-            plaintext = decrypt(nonce, ciphertext, old_key)
+            plaintext = decrypt(bytes(nonce), bytes(ciphertext), old_key)
         except Exception:
-            sys.exit(f"[passchain] Failed to decrypt entry for {service} / {username}. Aborting master password change.")
-        
+            sys.exit(f"[passchain] Failed to decrypt entry for {service} / {username}. Aborting.")
+
         new_nonce, new_ciphertext = encrypt(plaintext, new_master_key)
         with conn.cursor() as cur:
             cur.execute("""
@@ -322,18 +298,61 @@ def cmd_change_master(conn, args):
                 SET kdf_salt = %s, nonce = %s, ciphertext = %s
                 WHERE service = %s AND username = %s
             """, (new_salt, new_nonce, new_ciphertext, service, username))
-    set_master_key(conn, new_pw1, commit=False)
+
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM passchain_master")
+
+    set_master_key(conn, new_pw1, commit=False)  # now accepts commit param
     conn.commit()
     print(f"[passchain] Done. {len(entries)} entries re-encrypted.")
-    
+
 def main():
     conn = get_conn(get_dsn())
     ensure_tables(conn)
 
-    # Placeholder for CLI commands (e.g., init, add, get, list)
-    print("[passchain] Database initialized and ready.")
+    parser = argparse.ArgumentParser(
+        prog="passchain",
+        description="Local encrypted password manager with blockchain integrity.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("init",          help="First-time setup")
+    sub.add_parser("change-master", help="Change master password (re-encrypts all entries)")
+
+    p_add = sub.add_parser("add",    help="Add a credential")
+    p_add.add_argument("service")
+    p_add.add_argument("username")
+
+    p_update = sub.add_parser("update", help="Update a credential")
+    p_update.add_argument("service")
+    p_update.add_argument("username")
+
+    p_get = sub.add_parser("get",    help="Retrieve a credential")
+    p_get.add_argument("service")
+    p_get.add_argument("username")
+
+    p_list = sub.add_parser("list",  help="List all credentials (no passwords shown)")
+    p_list.add_argument("service", nargs="?", default=None, help="Optional service filter")
+
+    p_del = sub.add_parser("delete", help="Delete a credential")
+    p_del.add_argument("service")
+    p_del.add_argument("username")
+
+    args = parser.parse_args()
+
+    dispatch = {
+        "init":          cmd_init,
+        "add":           cmd_add,
+        "update":        cmd_update,
+        "get":           cmd_get,
+        "list":          cmd_list,
+        "delete":        cmd_delete,
+        "change-master": cmd_change_master,
+    }
+    dispatch[args.command](conn, args)
     conn.close()
- 
- 
+
+
 if __name__ == "__main__":
     main()
